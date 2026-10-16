@@ -1,0 +1,2114 @@
+    # ===========================================================
+    #  HVAC_MULTI_Z — multi-Zone HVAC Controller  (Merged v2)
+    #  Board   : ESP32-S3-DevKitC-1
+    #  Framework: esp-idf
+    #
+    #  ┌─ FLOOR 1 (Zone 0) ──────────────────────────────────┐
+    #  │  • Daikin split via Faikin firmware (MQTT: Faikout/AC1)│
+    #  │  • Gas furnace on relay4_4_1 pins 0–3 (Y-BLOWER, G, W, spare)│
+    #  │  • Thermostat inputs: PCF8575 pins 0–3               │
+    #  │  • Signal routing: relay4_4_1 (R1_1–R1_4)           │
+    #  │  • No damper or thermostat control on Floor 1        │
+    #  │  • Heating modes: heat_pump | gas | combined         │
+    #  └──────────────────────────────────────────────────────┘
+    #  ┌─ FLOOR 2 (4 zones) ─────────────────────────────────┐
+    #  │  • Daikin split via Faikin firmware (MQTT: Faikout/AC2)│
+    #  │  • Zones 1-3: hardwired thermostats, PCF8575 pins 4–15│
+    #  │  • Zone 2 (bathroom): Zigbee wireless thermostat (TBD)│
+    #  │    → Zigbee2MQTT publishes to MQTT_PREFIX/floor2/    │
+    #  │      zone2/damper/position/set                       │
+    #  │  • 4× dampers: HVAC_DAMPER_1–4 (3× SSR relay pairs + 1× PWM analog)│
+    #  │  • 2× PWM fans (fanhub_pwm0–1), auto-speed per zone │
+    #  │  • NO ZONE OR duct  PRESSURE OR TEMO sensors   REQUIED │
+    #  │  • BME680 AQI (calculated IAQ 0–500)                │
+    #  └──────────────────────────────────────────────────────┘
+    #
+    #  Daikin integration: Faikin firmware on separate ESP32.
+    #  This device sends JSON to Faikout/{device}/command and
+    #  receives state from Faikout/{device}/state via MQTT.
+    #  No Arduino-dependent external component needed.
+    #
+    #  SSR assignment — by damper, not by switch block label name
+    #  (switch labels below now match this mapping; confirmed via live testing):
+    #    Damper 1 (Zone 1):          SSR_2 CLOSE / SSR_3 OPEN
+    #    Damper 2 (Zone 2 / bathroom): SSR_4 CLOSE / SSR_5 OPEN
+    #    Damper 3 (Zone 3):          SSR_0 CLOSE / SSR_1 OPEN
+    #    Damper 4 (Master Bedroom):  0–10V analog via PWM, no SSR/relays
+    #    SSR_6 / SSR_7:               spare, unused (not wired to any damper)
+    #
+    #  Furnace relays on relay4_4_1 (PCA9554 0x38) — pins 0–3:  ← CONFIRMED correct
+    #    furnace_Y_BLOWER → relay4_4_1 pin 0
+    #    furnace_G        → relay4_4_1 pin 1
+    #    furnace_W        → relay4_4_1 pin 2
+    #    fan_power_120    → relay4_4_1 pin 3 (2nd floor fan power, not furnace)
+    #  Note: only 1 relay board total; no AUX relay
+    #
+    #   thermostat input pin map:
+    #    0-3: Zone 0  (Y1, W, G, OPT)   Floor 1
+    #    4-7: Zone 4  (Y1, W, G, OPT)   Floor 2 (Master Bedroom)
+    #    8-11: Zone 1 (Y1, W, G, OPT)   Floor 2
+    #   12-15: Zone 3 (Y1, W, G, OPT)   Floor 2
+    # ===========================================================
+    # [ADDED] — substitutions block; fixes $friendly_name references
+    substitutions:
+      device_name: multi-z-mk-ii
+      friendly_name:  MULTI_Z_MK_II
+      faikin_ac1: "Faikout/AC1" # Faikin device name for Floor 1 Daikin
+      faikin_ac2: "Faikout/AC2" # Faikin device name for Floor 2 Daikin
+      mqtt_prefix: "HVAC_MULTI_Z"
+      # ── Zigbee window sensor IEEE addresses (from Zigbee2MQTT device list) ───
+      # Replace placeholder values with actual addresses before flashing
+      zwin_z0_ieee: "0x00158d008b643f13" # Floor 1 Zone 0 — Aqara MCCGQ11LM (confirmed)
+      # Zone 2 (bathroom) Aqara W100 thermostat display — Zigbee2MQTT friendly_name
+      w100_zone2_name: "Z2_FLOOR 2_BATH"
+
+    esphome:
+      name: ${device_name}
+      friendly_name: ${friendly_name}
+      min_version: 2025.5.0
+      name_add_mac_suffix: false
+      compile_process_limit: 1 # build host runs out of RAM with parallel jobs (cc1plus killed)
+      comment: "multi-zone HVAC controller with timed dampers, PWM fan, and BME680 AQI"
+      on_boot:
+        priority: 200
+        then:
+          - output.turn_off: GPIO5_pin # SET TO LOW FOR DRV8833 HALF bridge IN 2
+          - output.turn_on: GPIO47_pin # SET TO LOW for DRV8833 HALF bridge IN 4
+          # Home all dampers: full OPEN stroke, then full CLOSE stroke (~3 min total)
+          - script.execute: damper_homing
+          - mqtt.publish:
+              topic: ${mqtt_prefix}/status
+              payload: "online"
+              retain: FALSE
+          # Publish retained settings so dashboard always reflects current state
+          - lambda: |-
+              mqtt::global_mqtt_client->publish(
+                  "${mqtt_prefix}/settings/window_sensors/state",
+                  id(win_sensors_enabled) ? "on" : "off", 0, true);
+
+          - mqtt.publish:
+              topic: ${faikin_ac1}/command
+              payload: "{\"power\":false}"
+              qos: 1
+              retain: false
+          - mqtt.publish:
+              topic: ${faikin_ac2}/command
+              payload: "{\"power\":false}"
+              qos: 1
+              retain: false
+      on_shutdown:
+        priority: 100
+        then:
+          - mqtt.publish:
+              topic: ${faikin_ac1}/command
+              payload: "{\"power\":false}"
+              qos: 1
+              retain: false
+          - mqtt.publish:
+              topic: ${faikin_ac2}/command
+              payload: "{\"power\":false}"
+              qos: 1
+              retain: false
+
+
+    esp32:
+      board: esp32-s3-devkitc-1
+      framework:
+        type: esp-idf
+
+    logger:
+
+    preferences:
+      flash_write_interval: 60 min # Prevents excessive wear
+
+    # ─── GLOBALS ──────────────────────────────────────────────────────────────────
+    globals:
+      - id: damper_position_masterbed
+        type: float
+        restore_value: true
+        initial_value: "0.0"
+
+      # Floor 2 coordinator state
+      - id: floor2_mode # 0=off 1=heat 2=cool 3=fan
+        type: int
+        restore_value: false
+        initial_value: "0"
+      - id: floor2_locked # mode-change lockout (3 min compressor protection)
+        type: bool
+        restore_value: false
+        initial_value: "false"
+      # Postflow: bitmask of dampers (bit0=D1 .. bit3=D4) held open with fans
+      # running after a heat/cool call ends. Cleared by f2_postflow_timer.
+      - id: f2_postflow_mask
+        type: int
+        restore_value: false
+        initial_value: "0"
+      # Dampers opened by the active mode on the previous coordinator run
+      - id: f2_last_open_mask
+        type: int
+        restore_value: false
+        initial_value: "0"
+      # True while damper_homing runs at boot — Floor 2 coordinator is held off.
+      # Starts true so nothing can move the dampers before homing begins.
+      - id: dampers_homing
+        type: bool
+        restore_value: false
+        initial_value: "true"
+      # ── Window sensor master enable ──────────────────────────────────────────
+      # Set false to disable window inhibition (e.g. dead batteries).
+      # Controlled via MQTT: HVAC_MULTI_Z/settings/window_sensors/set  (on / off)
+      # State published retained: HVAC_MULTI_Z/settings/window_sensors/state
+
+      #default is fralse -> window lockout disabled
+
+      - id: win_sensors_enabled
+        type: bool
+        restore_value: true
+        initial_value: "false"
+
+      - id: floor_2_manual_enabled
+        type: bool
+        restore_value: true
+        initial_value: "false"
+
+      # Zone window state — set via MQTT from Zigbee window sensors (Zigbee2MQTT)
+      # All zones use Aqara/Zigbee contact sensors via Zigbee2MQTT; no hardwired reed switches
+      - id: z0_win_open # Floor 1 Zone 0 — Aqara MCCGQ11LM (confirmed)
+        type: bool
+        restore_value: false
+      # Zone 2 (bathroom) demand — set via MQTT from Zigbee2MQTT (no hardwired thermostat)
+      - id: z2_req_heat
+        type: bool
+        restore_value: false
+        initial_value: "false"
+      - id: z2_req_cool
+        type: bool
+        restore_value: false
+        initial_value: "false"
+
+      # ── Zone 2 W100 thermostat state (persisted between partial Zigbee2MQTT updates) ──
+      # Z2M only publishes the attribute(s) that changed, not a full snapshot, so we
+      # keep the last-known mode/setpoint/temperature here and recompute the
+      # Zone 2 heat/cool/fan request with hysteresis every time any one of them updates.
+      - id: z2_mode # 0=off 1=heat 2=cool 3=auto
+        type: int
+        restore_value: false
+        initial_value: "0"
+      - id: z2_fan_mode # W100 fan speed setting as reported (logged only for now)
+        type: std::string
+        restore_value: false
+        initial_value: '""'
+      - id: z2_setpoint
+        type: float
+        restore_value: false
+        initial_value: "20.0"
+      - id: z2_local_temp
+        type: float
+        restore_value: false
+        initial_value: "20.0"
+
+    api:
+      encryption:
+        key: !secret api_key
+
+    ota:
+      - platform: esphome
+        password: !secret ota_password
+
+    wifi:
+      ssid: !secret wifi_ssid
+      password: !secret wifi_password
+      ap:
+        ssid: "Hvac-Control Fallback Hotspot"
+        password: !secret ap_password
+
+    captive_portal:
+
+    web_server:
+      port: 80
+      auth:
+        username: !secret web_server_username
+        password: !secret web_server_password
+      version: 3
+
+    debug:
+      update_interval: 5s
+
+    # ─── MQTT ────────────────────────────────────────────────────────────────────
+    mqtt:
+      broker: !secret mqtt_broker
+      username: !secret mqtt_username
+      password: !secret mqtt_password
+      topic_prefix: ${mqtt_prefix}
+      birth_message:
+        topic: ${mqtt_prefix}/status
+        payload: online
+        retain: true
+      will_message:
+        topic: ${mqtt_prefix}/status
+        payload: offline
+        retain: true
+
+      on_message:
+        - topic: ${faikin_ac1}/state
+          then:
+            - lambda: |-
+                json::parse_json(x, [](JsonObject root) -> bool {
+                  if (root.containsKey("power")) {
+                    id(AC1_power).publish_state(root["power"].as<bool>());
+                  }
+                  if (root.containsKey("fanfreq")) {
+                    id(AC1_fanfreq).publish_state(root["fanfreq"].as<float>());
+                  }
+                  return true;
+                });
+
+        - topic: ${faikin_ac2}/state
+          then:
+            - lambda: |-
+                json::parse_json(x, [](JsonObject root) -> bool {
+                  if (root.containsKey("power")) {
+                    id(AC2_power).publish_state(root["power"].as<bool>());
+                  }
+                  if (root.containsKey("fanfreq")) {
+                    id(AC2_fanfreq).publish_state(root["fanfreq"].as<float>());
+                  }
+                  return true;
+                });
+        # Manual position command: publish 0.0–1.0 (or 0–100) to this topic
+        # e.g.  mosquitto_pub -t COVER_ANALOG/damper/position/set -m 0.5
+        - topic: ${mqtt_prefix}/damper/position/set
+          then:
+            - lambda: |-
+                float pos = atof(x.c_str());
+                // Accept either 0.0-1.0 or 0-100
+                if (pos > 1.0f) pos /= 100.0f;
+                pos = std::max(0.0f, std::min(1.0f, pos));
+                auto call = id(HVAC_DAMPER_4).make_call();
+                call.set_position(pos);
+                call.perform();
+
+            # ── Floor 1 heating mode: heat_pump | gas | combined ──
+        - topic: ${mqtt_prefix}/floor1/heat_mode/set
+          then:
+            - select.set:
+                id: sel_f1_heat_mode
+                option: !lambda "return x;"
+
+
+        # ── Floor 1 scene preset ──────────────────────────────
+        - topic: ${mqtt_prefix}/floor1/scene/set
+          then:
+            - lambda: |-
+                std::string s = x;
+                float temp = 21.0f;
+                std::string mode = "H";
+                std::string fan  = "A";
+                if      (s == "morning") { temp = 21.0f; mode = "H"; }
+                else if (s == "night")   { temp = 18.0f; mode = "H"; fan = "1"; }
+                else if (s == "away")    { temp = 15.0f; mode = "H"; }
+                else if (s == "eco")     { temp = 19.0f; mode = "H"; fan = "1"; }
+                else if (s == "comfort") { temp = 22.0f; mode = "H";
+                                          id(sel_f1_heat_mode).make_call().set_option("combined").perform(); }
+                else if (s == "cool")    { temp = 24.0f; mode = "C"; }
+                // Publish to Faikin AC1
+                auto doc = std::string("{\"power\":true,\"mode\":\"") + mode +
+                          "\",\"temp\":" + to_string((int)temp) +
+                          ",\"fan\":\"" + fan + "\"}";
+                mqtt::global_mqtt_client->publish("${faikin_ac1}/command", doc);
+
+        # ── Floor 1 direct Faikin passthrough ─────────────────
+        - topic: ${mqtt_prefix}/floor1/ac/command
+          then:
+            - lambda: |-
+                mqtt::global_mqtt_client->publish("${faikin_ac1}/command", x);
+
+        - topic: ${mqtt_prefix}/floor2/ac/command
+          then:
+            - lambda: |-
+                mqtt::global_mqtt_client->publish("${faikin_ac2}/command", x);
+
+        # ── Zone 2 (bathroom) manual demand override — for testing without the W100 ──
+        # Publish heat/cool/off directly to force a call, bypassing the W100 logic below.
+        - topic: ${mqtt_prefix}/floor2/zone2/demand/set
+          then:
+            - lambda: |-
+                id(z2_req_heat) = (x == "heat");
+                id(z2_req_cool) = (x == "cool");
+            - script.execute: update_f2_coordinator
+
+        # ── Zone 2 (bathroom) Aqara W100 thermostat display via Zigbee2MQTT ──────
+        # W100 in thermostat mode: system_mode auto | heat | cool | off, one
+        # setpoint, and a 4-speed fan_mode (no fan-only mode). Z2M publishes only the
+        # attribute(s) that changed, so persist mode/setpoint/temperature in globals
+        # and recompute the Zone 2 request every update:
+        #   heat: on at temp <= sp - 0.5, off at temp >= sp
+        #   cool: on at temp >= sp + 0.5, off at temp <= sp
+        #   auto: heat below the setpoint, cool above it, same thresholds
+        # Zone 2 has no fan-only request.
+        # !! Key names below follow Z2M's standard climate exposes — verify against
+        #    the W100's State tab in Zigbee2MQTT and adjust if they differ.
+        - topic: "zigbee2mqtt/${w100_zone2_name}"
+          then:
+            - lambda: |-
+                json::parse_json(x, [](JsonObject root) -> bool {
+                  if (root.containsKey("system_mode")) {
+                    std::string mode = root["system_mode"].as<std::string>();
+                    int m = 0;
+                    if      (mode == "heat") m = 1;
+                    else if (mode == "cool") m = 2;
+                    else if (mode == "auto") m = 3;
+                    else if (mode != "off")
+                      ESP_LOGW("w100_zone2", "unhandled system_mode '%s' — treated as off", mode.c_str());
+                    if (m != id(z2_mode)) {
+                      // Mode changed: drop any request from the previous mode
+                      id(z2_req_heat) = false;
+                      id(z2_req_cool) = false;
+                    }
+                    id(z2_mode) = m;
+                  }
+                  // Single setpoint: prefer the field that matches the active mode,
+                  // fall back to whichever setpoint field the W100 sends.
+                  if (id(z2_mode) == 2 && root.containsKey("occupied_cooling_setpoint")) {
+                    id(z2_setpoint) = root["occupied_cooling_setpoint"].as<float>();
+                  } else if (root.containsKey("occupied_heating_setpoint")) {
+                    id(z2_setpoint) = root["occupied_heating_setpoint"].as<float>();
+                  } else if (root.containsKey("occupied_cooling_setpoint")) {
+                    id(z2_setpoint) = root["occupied_cooling_setpoint"].as<float>();
+                  }
+                  if (root.containsKey("local_temperature")) {
+                    id(z2_local_temp) = root["local_temperature"].as<float>();
+                  }
+                  if (root.containsKey("fan_mode")) {
+                    id(z2_fan_mode) = root["fan_mode"].as<std::string>();
+                  }
+
+                  float sp = id(z2_setpoint);
+                  float t  = id(z2_local_temp);
+                  switch (id(z2_mode)) {
+                    case 1:  // heat
+                      id(z2_req_cool) = false;
+                      if (t <= sp - 0.5f) id(z2_req_heat) = true;
+                      else if (t >= sp)   id(z2_req_heat) = false;
+                      break;
+                    case 2:  // cool
+                      id(z2_req_heat) = false;
+                      if (t >= sp + 0.5f) id(z2_req_cool) = true;
+                      else if (t <= sp)   id(z2_req_cool) = false;
+                      break;
+                    case 3:  // auto: heat below the setpoint, cool above it
+                      if (t <= sp - 0.5f)      { id(z2_req_heat) = true;  id(z2_req_cool) = false; }
+                      else if (t >= sp + 0.5f) { id(z2_req_cool) = true;  id(z2_req_heat) = false; }
+                      else {
+                        if (id(z2_req_heat) && t >= sp) id(z2_req_heat) = false;
+                        if (id(z2_req_cool) && t <= sp) id(z2_req_cool) = false;
+                      }
+                      break;
+                    default: // off
+                      id(z2_req_heat) = false; id(z2_req_cool) = false;
+                  }
+                  // Within a hysteresis band the previous request is kept.
+                  ESP_LOGD("w100_zone2", "mode=%d sp=%.1f temp=%.1f fan='%s' -> heat=%d cool=%d",
+                          id(z2_mode), sp, t, id(z2_fan_mode).c_str(),
+                          id(z2_req_heat), id(z2_req_cool));
+                  return true;
+                });
+            - script.execute: update_f2_coordinator
+
+        # ── Floor 1 Zone 0 window sensor — Aqara MCCGQ11LM via Zigbee2MQTT ───────
+        # contact:true = closed, contact:false = open
+        - topic: "zigbee2mqtt/${zwin_z0_ieee}"
+          then:
+            - lambda: |-
+                // Parse {"contact": true/false, ...}
+                bool contact = true;
+                auto pos = x.find("\"contact\":");
+                if (pos != std::string::npos) {
+                    pos += 10;
+                    while (pos < x.size() && x[pos] == ' ') pos++;
+                    contact = (x.substr(pos, 4) == "true");
+                }
+                bool was_open = id(z0_win_open);
+                id(z0_win_open) = !contact;   // contact=false → window open
+
+                bool effective_open = id(z0_win_open) && id(win_sensors_enabled);
+                bool was_effective  = was_open           && id(win_sensors_enabled);
+
+                if (!was_effective && effective_open) {
+                    // Window just became effectively OPEN — shut down Floor 1 HVAC
+                    mqtt::global_mqtt_client->publish("${faikin_ac1}/command", "{\"power\":false}");
+                    id(furnace_W).turn_off();
+                    id(furnace_G).turn_off();
+                    id(furnace_Y_BLOWER).turn_off();
+                    auto c = id(RGB_LED).make_call();
+                    c.set_state(true); c.set_rgb(1.0f, 0.0f, 0.0f);
+                    c.set_brightness(1.0f); c.set_effect("pulse");
+                    c.perform();
+                    ESP_LOGW("win_z0", "Window OPEN — Floor 1 HVAC inhibited");
+                } else if (was_effective && !effective_open) {
+                    // Window closed (or sensors disabled) — clear inhibit LED
+                    id(RGB_LED).make_call().set_state(false).perform();
+                    ESP_LOGI("win_z0", "Window CLOSED — Floor 1 HVAC inhibit cleared");
+                }
+                // Publish state for HA visibility
+                    mqtt::global_mqtt_client->publish(
+                    "${mqtt_prefix}/floor1/zone0/window/state",
+                    id(z0_win_open) ? "open" : "closed", 0, true);
+            - script.execute: update_f1_coordinator  # resume Floor 1 once the window closes
+
+        # ── Window sensor master enable (dashboard-accessible setting) ───────────
+        # Payload: "on" or "off"   — disables all window inhibition (e.g. dead batteries)
+        - topic: ${mqtt_prefix}/settings/window_sensors/set
+          then:
+            - lambda: |-
+                id(win_sensors_enabled) = (x == "on" || x == "true" || x == "1");
+                mqtt::global_mqtt_client->publish(
+                    "${mqtt_prefix}/settings/window_sensors/state",
+                    id(win_sensors_enabled) ? "on" : "off", 0, true);
+                ESP_LOGI("settings", "Window sensors %s",
+                        id(win_sensors_enabled) ? "ENABLED" : "DISABLED");
+            - script.execute: update_f1_coordinator
+            - script.execute: update_f2_coordinator  # Re-evaluate Floor 2 HVAC state if sensors disabled
+
+        # ── Floor 2 damper direct position override ───────────
+        # Zone 2 (bathroom): triggered by Zigbee2MQTT automation once thermostat is configured
+        - topic: ${mqtt_prefix}/floor2/zone1/damper/position/set
+          then:
+            - cover.control:
+                id: HVAC_DAMPER_1
+                position: !lambda "return atof(x.c_str()) / 100.0f;"
+
+        - topic: ${mqtt_prefix}/floor2/zone2/damper/position/set
+          then:
+            - cover.control:
+                id: HVAC_DAMPER_2
+                position: !lambda  "return atof(x.c_str()) / 100.0f;"
+
+        - topic: ${mqtt_prefix}/floor2/zone3/damper/position/set
+          then:
+            - cover.control:
+                id: HVAC_DAMPER_3
+                position: !lambda "return atof(x.c_str()) / 100.0f;"
+
+        # ── System-wide commands ──────────────────────────────
+        - topic: ${mqtt_prefix}/command
+          then:
+            - lambda: |-
+                ESP_LOGD("from lambda", "before all_off : %s", x.c_str());
+                if (x == "all_off") {
+                  id(HVAC_DAMPER_4).make_call().set_command_close().perform();
+                  id(HVAC_DAMPER_1).make_call().set_command_close().perform();
+                  id(HVAC_DAMPER_2).make_call().set_command_close().perform();
+                  id(HVAC_DAMPER_3).make_call().set_command_close().perform();
+                  id(furnace_W).turn_off();
+                  id(furnace_G).turn_off();
+                  id(furnace_Y_BLOWER).turn_off();
+                  mqtt::global_mqtt_client->publish("${faikin_ac1}/command", "{\"power\":false}");
+                  mqtt::global_mqtt_client->publish("${faikin_ac2}/command", "{\"power\":false}");
+                } else if (x == "away") {
+                  mqtt::global_mqtt_client->publish("${faikin_ac1}/command", "{\"power\":true,\"mode\":\"H\",\"temp\":15}");
+                  mqtt::global_mqtt_client->publish("${faikin_ac2}/command", "{\"power\":true,\"mode\":\"H\",\"temp\":15}");
+                  id(furnace_W).turn_off();
+                  id(furnace_G).turn_off();
+                  id(furnace_Y_BLOWER).turn_off();
+                } else if (x == "night") {
+                  // mqtt::global_mqtt_client->publish("${faikin_ac1}/command", "{\"power\":true,\"mode\":\"H\",\"temp\":18,\"fan\":\"3\"}");
+                  // mqtt::global_mqtt_client->publish("${faikin_ac2}/command", "{\"power\":true,\"mode\":\"H\",\"temp\":18,\"fan\":\"3\"}");
+                }
+
+        # ── Receive Faikin AC state and re-publish ──
+        - topic: "${faikin_ac1}/state"
+          then:
+            - mqtt.publish:
+                topic: ${mqtt_prefix}/floor1/ac/state
+                payload: !lambda "return x;"
+                retain: false
+
+        - topic: "${faikin_ac2}/state"
+          then:
+            - mqtt.publish:
+                topic: ${mqtt_prefix}/floor2/ac/state
+                payload: !lambda "return x;"
+                retain: false
+
+    # ─── I2C ─────────────────────────────────────────────────────────────────────
+    i2c:
+      - id: bus_a
+        sda: 8
+        scl: 9
+        scan: true
+        frequency: 100kHz
+      # !! CLAUDE DO NOT TOUCH !! Must ask first — intentional spare bus; future use
+      - id: bus_b
+        sda: 16
+        scl: 15
+        scan: true
+        frequency: 100kHz
+
+    # ─── TCA9548A I2C multiplexer ────────────────────────────────────────────────
+
+    # ─── One-Wire (DS2484 I2C-to-1-Wire bridge) ──────────────────────────────────
+    one_wire:
+      - platform: ds2484
+        i2c_id: bus_a
+        active_pullup: true
+
+    # ─── OUTPUTS ─────────────────────────────────────────────────────────────────
+    output:
+      - platform: ledc
+        pin: GPIO4
+        frequency: 4500 Hz
+        id: fanhub_pwm0
+        inverted: false
+        min_power: 10%
+        max_power: 90%
+        channel: 0
+
+      - platform: gpio
+        pin: GPIO5
+        id: GPIO5_pin
+
+      - platform: ledc
+        pin: GPIO6
+        frequency: 4500 Hz
+        id: fanhub_pwm1
+        inverted: true
+        min_power: 10%
+        max_power: 90%
+        channel: 1
+
+      - platform: gpio
+        pin: GPIO47
+        id: GPIO47_pin
+
+      # for damper 4 (master bedroom) — PWM output
+
+      - platform: ledc
+        pin: GPIO42
+        frequency: 4500 Hz
+        id: PWM_DAMPER_4_OUTPUT
+        inverted: false
+        min_power: 0%
+        max_power: 100%
+        channel: 2
+
+      - platform: ledc
+        pin: GPIO21
+        id: led_status_rgb
+        frequency: 4500 Hz
+        inverted: true
+        min_power: 0%
+        max_power: 60%
+        channel: 3
+
+    # ─── FANS ────────────────────────────────────────────────────────────────────
+    # fan 0 AND 1 INSTALLED FOR 2ND FLOOR ONLY
+    # fan 2,3 spare channels
+
+    fan:
+      - platform: speed
+        output: fanhub_pwm0
+        name: FAN_0
+        id: fan0
+        icon: "mdi:fan"
+        on_turn_on:
+          - script.execute: fanpower_controller
+
+        on_turn_off:
+          #  - delay: 0.1s
+          - output.set_level:
+              id: fanhub_pwm0
+              level: 0.0
+          - script.execute: fanpower_controller
+
+
+      - platform: speed
+        output: fanhub_pwm1
+        name: FAN_1
+        id: fan1
+        icon: "mdi:fan"
+        on_turn_on:
+          - script.execute: fanpower_controller
+        on_turn_off:
+          #  - delay: 0.1s
+          - output.set_level:
+              id: fanhub_pwm1
+              level: 0.0
+          - script.execute: fanpower_controller
+
+
+    # ─── NUMBER sliders ───────────────────────────────────────────────────────────
+    number:
+      # Zone priority weights (1–5). Zone 1 = Master Bedroom, default weight 2.
+      - platform: template
+        name: "Zone 1 Priority Weight"
+        id: z1_weight
+        icon: "mdi:weight"
+        min_value: 1
+        max_value: 5
+        step: 1
+        initial_value: 2
+        restore_value: true
+        optimistic: true
+        on_value:
+          then:
+            - script.execute: update_f2_coordinator
+
+      - platform: template
+        name: "Zone 3 Priority Weight"
+        id: z3_weight
+        icon: "mdi:weight"
+        min_value: 1
+        max_value: 5
+        step: 1
+        initial_value: 1
+        restore_value: true
+        optimistic: true
+        on_value:
+          then:
+            - script.execute: update_f2_coordinator
+      - platform: template
+        name: "Zone 4 Priority Weight"
+        id: z4_weight
+        icon: "mdi:weight"
+        min_value: 1
+        max_value: 5
+        step: 1
+        initial_value: 1
+        restore_value: true
+        optimistic: true
+        on_value:
+          then:
+            - script.execute: update_f2_coordinator
+      - platform: template
+        name: "Zone 2 Priority Weight"
+        id: z2_weight
+        icon: "mdi:weight"
+        min_value: 1
+        max_value: 5
+        step: 1
+        initial_value: 1
+        restore_value: true
+        optimistic: true
+        on_value:
+          then:
+            - script.execute: update_f2_coordinator
+
+      # Duct temperature setpoints for satisfaction detection.
+      # Set to expected supply-air temp for the current season:
+      #   Heat mode: ~35-40 degC  |  Cool mode: ~10-14 degC
+
+    # ─── I2C GPIO EXPANDERS ───────────────────────────────────────────────────────
+    pca9554:
+      - id: relay4_4_1
+        address: 0x38
+        i2c_id: bus_a
+        # !! CLAUDE DO NOT TOUCH !! pin assignments confirmed correct by owner
+        # pins 0–3: furnace relays (Y-BLOWER, W, G, spare)  ← confirmed
+        # (header previously said 4-6; pins 0-3 is the correct wiring)
+
+    pcf8574:
+      - id: pcf8574_hub
+        i2c_id: bus_a
+        address: 0x21
+        pcf8575: false
+
+      - id: pcf8575_hub
+        i2c_id: bus_a
+        address: 0x20
+        pcf8575: true
+
+    # ─── SWITCHES ────────────────────────────────────────────────────────────────
+    switch:
+      - platform: restart
+        name: "Restart-RESET"
+
+      - platform: template
+        name: "Show Total in Fan Status"
+        id: show_total_fans
+        icon: mdi:ab-testing
+        optimistic: true
+        restore_mode: RESTORE_DEFAULT_OFF
+
+      # ── Window sensors master enable — visible in HA / future dashboard ────────
+      # Set via MQTT: HVAC_MULTI_Z/settings/window_sensors/set  (on / off)
+      - platform: template
+        name: "Window Sensors Enabled"
+        id: win_sensors_enabled_switch
+        lambda: "return id(win_sensors_enabled);"
+        turn_on_action:
+          lambda: "id(win_sensors_enabled) = true;"
+        turn_off_action:
+          lambda: "id(win_sensors_enabled) = false;"
+
+      - platform: template
+        name: "floor 2 manual"
+        id: floor_2_manual_enabled_switch
+        lambda: "return id(floor_2_manual_enabled);" # global setting
+        turn_on_action:
+          lambda: "id(floor_2_manual_enabled) = true;"
+        turn_off_action:
+          lambda: "id(floor_2_manual_enabled) = false;"
+
+      # ── Zone 2 (bathroom) mode enables ─────────────────────────────────────────
+      # Gate which Zone 2 requests (heat / cool) the Floor 2 coordinator acts on. A disabled
+      # mode is ignored: Zone 2 doesn't vote for it and its damper doesn't open for it.
+      # Default ON (keeps existing behaviour); restored across reboots.
+      - platform: template
+        name: "Zone 2 Heating Enabled"
+        id: z2_heat_enabled
+        icon: mdi:radiator
+        optimistic: true
+        restore_mode: RESTORE_DEFAULT_ON
+        on_turn_on:
+          - script.execute: update_f2_coordinator
+        on_turn_off:
+          - script.execute: update_f2_coordinator
+
+      - platform: template
+        name: "Zone 2 Cooling Enabled"
+        id: z2_cool_enabled
+        icon: mdi:snowflake
+        optimistic: true
+        restore_mode: RESTORE_DEFAULT_ON
+        on_turn_on:
+          - script.execute: update_f2_coordinator
+        on_turn_off:
+          - script.execute: update_f2_coordinator
+
+      # ── SSR outputs via PCF8574 (pcf8574_hub 0x21) ───────────────────────────
+      # 2 relays per damper: CLOSE relay + OPEN relay (proportional, bidirectional)
+      # Floor 1: SSR_0 + SSR_1 in use (no duct damper; wired for other purpose)
+      # Zone 1: SSR_2 (CLOSE) + SSR_3 (OPEN)
+      # Zone 2: SSR_4 (CLOSE) + SSR_5 (OPEN)
+      # Zone 3: SSR_6 (CLOSE) + SSR_7 (OPEN)
+      # Zone 4: Pwm/0..10v
+
+      # Floor 2 Zone 2 (bathroom) damper — thermostat TBD (Zigbee2MQTT wireless thermostat)
+      # HVAC_DAMPER_2 cover entity is triggered via MQTT from Zigbee2MQTT bridge
+      # once the Zigbee thermostat is configured. SSR_4/SSR_5 are wired and ready.
+      - platform: gpio
+        name: "Zone 1 Damper CLOSE"
+        internal: true
+        id: SSR_2
+        pin:
+          {
+            pcf8574: pcf8574_hub,
+            number: 0,
+            mode: { output: true },
+            inverted: false,
+          }
+
+      - platform: gpio
+        name: "Zone 1 Damper OPEN"
+        id: SSR_3
+        internal: true
+        pin:
+          {
+            pcf8574: pcf8574_hub,
+            number: 1,
+            mode: { output: true },
+            inverted: false,
+          }
+
+      - platform: gpio
+        name: "Zone 3 Damper CLOSE"
+        id: SSR_0
+        internal: true
+        pin:
+          {
+            pcf8574: pcf8574_hub,
+            number: 2,
+            mode: { output: true },
+            inverted: false,
+          }
+
+      - platform: gpio
+        name: "Zone 3 Damper OPEN"
+        internal: true
+        id: SSR_1
+        pin:
+          {
+            pcf8574: pcf8574_hub,
+            number: 3,
+            mode: { output: true },
+            inverted: false,
+          }
+
+      - platform: gpio
+        name: "Zone 2 Damper CLOSE"
+        id: SSR_4
+        internal: true
+        pin:
+          {
+            pcf8574: pcf8574_hub,
+            number: 4,
+            mode: { output: true },
+            inverted: false,
+          }
+
+      - platform: gpio
+        name: "Zone 2 Damper OPEN"
+        id: SSR_5
+        internal: true
+        pin:
+          {
+            pcf8574: pcf8574_hub,
+            number: 5,
+            mode: { output: true },
+            inverted: false,
+          }
+
+      - platform: gpio
+        name: "Spare Damper CLOSE"
+        id: SSR_6
+        internal: true
+        pin:
+          {
+            pcf8574: pcf8574_hub,
+            number: 6,
+            mode: { output: true },
+            inverted: false,
+          }
+
+      - platform: gpio
+        name: "Spare Damper OPEN"
+        id: SSR_7
+        internal: true
+        pin:
+          {
+            pcf8574: pcf8574_hub,
+            number: 7,
+            mode: { output: true },
+            inverted: false,
+          }
+
+      # ── Gas furnace relays — relay4_4_1 (PCA9554 0x38) pins 0–3 ────────────────
+      # !! CLAUDE DO NOT TOUCH !! Pin assignments confirmed correct by owner (item #6)
+      # Pins 0-3: furnace (Y-BLOWER=0, W=1, G=2, spare=3)
+      # Wire relay NO contacts to furnace 24 VAC thermostat terminals.
+      # Relay COM to furnace C (common/24 VAC return).
+      - platform: gpio
+        name: "FAN POWER 2ND FLOOR 120V"
+        id: fan_power_120
+        pin:
+          {
+            pca9554: relay4_4_1,
+            number: 3,
+            mode: { output: true },
+            inverted: false,
+          }
+        restore_mode: RESTORE_DEFAULT_OFF
+        on_turn_on:
+          - mqtt.publish:
+              {
+                topic: "${mqtt_prefix}/floor1/furnace/spare/state",
+                payload: "on",
+                retain: false,
+              }
+        on_turn_off:
+          - mqtt.publish:
+              {
+                topic: "${mqtt_prefix}/floor1/furnace/spare/state",
+                payload: "off",
+                retain: false,
+              }
+
+      - platform: gpio
+        name: "Furnace blower FAN"
+        id: furnace_G
+        pin:
+          {
+            pca9554: relay4_4_1,
+            number: 1,
+            mode: { output: true },
+            inverted: false,
+          }
+        restore_mode: RESTORE_DEFAULT_OFF
+        on_turn_on:
+          - mqtt.publish:
+              {
+                topic: "${mqtt_prefix}/floor1/furnace/g/state",
+                payload: "on",
+                retain: false,
+              }
+        on_turn_off:
+          - mqtt.publish:
+              {
+                topic: "${mqtt_prefix}/floor1/furnace/g/state",
+                payload: "off",
+                retain: false,
+              }
+
+      - platform: gpio
+        name: "Furnace W (Heat)"
+        id: furnace_W
+        pin:
+          {
+            pca9554: relay4_4_1,
+            number: 2,
+            mode: { output: true },
+            inverted: false,
+          }
+        restore_mode: RESTORE_DEFAULT_OFF
+        on_turn_on:
+          - mqtt.publish:
+              {
+                topic: "${mqtt_prefix}/floor1/furnace/w1/state",
+                payload: "on",
+                retain: false,
+              }
+        on_turn_off:
+          - mqtt.publish:
+              {
+                topic: "${mqtt_prefix}/floor1/furnace/w1/state",
+                payload: "off",
+                retain: false,
+              }
+
+      - platform: gpio
+        name: "Furnace Y-BLOWER"
+        id: furnace_Y_BLOWER
+        pin:
+          {
+            pca9554: relay4_4_1,
+            number: 0,
+            mode: { output: true },
+            inverted: false,
+          }
+        restore_mode: RESTORE_DEFAULT_OFF
+        on_turn_on:
+          - mqtt.publish:
+              {
+                topic: "${mqtt_prefix}/floor1/furnace/y-blower/state",
+                payload: "on",
+                retain: false,
+              }
+        on_turn_off:
+          - mqtt.publish:
+              {
+                topic: "${mqtt_prefix}/floor1/furnace/y-blower/state",
+                payload: "off",
+                retain: false,
+              }
+
+    # ─── SELECT — Floor 1 Heating Mode ───────────────────────────────────────────
+    select:
+      - platform: template
+        id: sel_f1_heat_mode
+        name: "Floor 1 Heating Mode"
+        options: ["heat_pump", "gas", "combined"]
+        initial_option: "gas"
+        optimistic: true
+        restore_value: true
+        on_value:
+          then:
+            - lambda: |-
+                if (x == "heat_pump") {
+                //  mqtt::global_mqtt_client->publish("${faikin_ac1}/command", "{\"power\":true,\"mode\":\"H\"}");
+                //  id(furnace_W).turn_off();  // FIX #1: was furnace_W called twice; second call is now furnace_G
+                // id(furnace_G).turn_off();
+                } else if (x == "gas") {
+                //  mqtt::global_mqtt_client->publish("${faikin_ac1}/command", "{\"power\":false,\"mode\":\"F\"}");
+                //  id(furnace_G).turn_on();
+                //  id(furnace_W).turn_on();
+                } else if (x == "combined") {
+                //  mqtt::global_mqtt_client->publish("${faikin_ac1}/command", "{\"power\":true,\"mode\":\"H\"}");
+                //  id(furnace_G).turn_on();
+                //  id(furnace_W).turn_on();
+                }
+            - mqtt.publish:
+                topic: ${mqtt_prefix}/floor1/heat_mode/state
+                payload: !lambda "return x;"
+                retain: false
+            - script.execute: update_f1_coordinator  # apply new heat source to an active call
+
+    # ─── COVERS — Zone Dampers (proportional, bidirectional, 2 relays each) ──────
+    #  Each damper motor has separate OPEN and CLOSE windings.
+    #  time_based platform tracks position automatically by timing partial travel.
+    #
+    #  ⚠ Never energise OPEN and CLOSE simultaneously.
+    #
+    #  Damper 1: SSR_2 (CLOSE), SSR_3 (OPEN)  — Floor 2 Zone 1
+    #  Damper 2: SSR_4 (CLOSE), SSR_5 (OPEN)  — Floor 2 Zone 2 / Bathroom
+    #  Damper 3: SSR_0 (CLOSE), SSR_1 (OPEN)  — Floor 2 Zone 3
+    #  Damper 4: PWM_DAMPER_4_OUTPUT (0–10V analog actuator) — Master Bedroom
+    #    ~90s full 0-90° travel (~0.9s per 1% position); no relays involved.
+
+    cover:
+      # ── Damper — triggered via MQTT from Zigbee2MQTT when thermostat ready
+      - platform: time_based
+        name: "HVAC Damper 3"
+        id: HVAC_DAMPER_3
+        device_class: damper
+        assumed_state: true
+        open_action:
+          - switch.turn_off: SSR_0
+          - switch.turn_on: SSR_1
+        close_action:
+          - switch.turn_off: SSR_1
+          - switch.turn_on: SSR_0
+        stop_action:
+          - switch.turn_off: SSR_0
+          - switch.turn_off: SSR_1
+        open_duration: 15.9s
+        close_duration: 15.9s
+        on_idle:
+          - mqtt.publish_json:
+              topic: ${mqtt_prefix}/floor2/zone3/damper/state
+              retain: true
+              payload: |-
+                root["position"] = (int)(id(HVAC_DAMPER_3).position * 100);
+                auto s = id(HVAC_DAMPER_3).current_operation;
+                root["state"] = (s == esphome::cover::COVER_OPERATION_OPENING) ? "opening" :
+                                (s == esphome::cover::COVER_OPERATION_CLOSING) ? "closing" : "stopped";
+
+      - platform: time_based
+        name: "HVAC Damper 1"
+        id: HVAC_DAMPER_1
+        device_class: damper
+        assumed_state: true
+        open_action:
+          - switch.turn_off: SSR_2
+          - switch.turn_on: SSR_3
+        close_action:
+          - switch.turn_off: SSR_3
+          - switch.turn_on: SSR_2
+        stop_action:
+          - switch.turn_off: SSR_2
+          - switch.turn_off: SSR_3
+        open_duration: 15.9s
+        close_duration: 15.9s
+        on_idle:
+          - mqtt.publish_json:
+              topic: ${mqtt_prefix}/floor2/zone1/damper/state
+              retain: true
+              payload: |-
+                root["position"] = (int)(id(HVAC_DAMPER_1).position * 100);
+                auto s = id(HVAC_DAMPER_1).current_operation;
+                root["state"] = (s == esphome::cover::COVER_OPERATION_OPENING) ? "opening" :
+                                (s == esphome::cover::COVER_OPERATION_CLOSING) ? "closing" : "stopped";
+
+      - platform: time_based
+        name: "HVAC Damper 2"
+        id: HVAC_DAMPER_2
+        device_class: damper
+        assumed_state: true
+        open_action:
+          - switch.turn_off: SSR_4
+          - switch.turn_on: SSR_5
+        close_action:
+          - switch.turn_off: SSR_5
+          - switch.turn_on: SSR_4
+        stop_action:
+          - switch.turn_off: SSR_4
+          - switch.turn_off: SSR_5
+        open_duration: 15.9s
+        close_duration: 15.9s
+        on_idle:
+          - mqtt.publish_json:
+              topic: ${mqtt_prefix}/floor2/zone2/damper/state
+              retain: true
+              payload: |-
+                root["position"] = (int)(id(HVAC_DAMPER_2).position * 100);
+                auto s = id(HVAC_DAMPER_2).current_operation;
+                root["state"] = (s == esphome::cover::COVER_OPERATION_OPENING) ? "opening" :
+                                (s == esphome::cover::COVER_OPERATION_CLOSING) ? "closing" : "stopped";
+
+      # ── Damper 4 — Master Bedroom, 0–10V proportional actuator via PWM ─────────
+      # No relays: open_action/close_action drive PWM straight to the endpoint
+      # voltage; the actuator ramps there on its own at ~0.9s per 1% position
+      # (matches open_duration/close_duration below). stop_action re-commands
+      # whatever position ESPHome's own timer has interpolated to, so an
+      # interrupted move settles wherever the physical actuator actually is.
+      - platform: time_based
+        name: "HVAC Damper 4 (Master Bedroom)"
+        id: HVAC_DAMPER_4
+        device_class: damper
+        assumed_state: true
+        open_action:
+          - lambda: id(PWM_DAMPER_4_OUTPUT).set_level(1.0);
+        close_action:
+          - lambda: id(PWM_DAMPER_4_OUTPUT).set_level(0.0);
+        stop_action:
+          - lambda: id(PWM_DAMPER_4_OUTPUT).set_level(id(HVAC_DAMPER_4).position);
+        open_duration: 90s
+        close_duration: 90s
+        on_idle:
+          - lambda: id(damper_position_masterbed) = id(HVAC_DAMPER_4).position;
+          - mqtt.publish_json:
+              topic: ${mqtt_prefix}/floor2/zone4/damper/state
+              retain: true
+              payload: |-
+                root["position"] = (int)(id(HVAC_DAMPER_4).position * 100);
+                auto s = id(HVAC_DAMPER_4).current_operation;
+                root["state"] = (s == esphome::cover::COVER_OPERATION_OPENING) ? "opening" :
+                                (s == esphome::cover::COVER_OPERATION_CLOSING) ? "closing" : "stopped";
+
+    # ─── SCRIPTS — Floor 2 coordinator + auxiliary ───────────────────────────────
+    # ── 4 minute compressor mode-change lockout ───────────────────────────────
+    script:
+      - id: mode_unlock_timer
+        mode: restart
+        then:
+          - delay: 4min
+          - lambda: "id(floor2_locked) = false;"
+
+      - id: fanpower_controller
+        mode: restart
+        # trigger_on_initial_state: true
+        then:
+          - if:
+              condition:
+                or:
+                  - fan.is_on: fan0
+                  - fan.is_on: fan1
+              then:
+                - switch.turn_on: fan_power_120
+              else:
+                - switch.turn_off: fan_power_120
+
+      # ── Damper homing at boot ─────────────────────────────────────────────
+      # Time-based dampers have no position feedback, so drive every damper
+      # through a full OPEN stroke and then a full CLOSE stroke to get a known
+      # position (closed). Position is forced to the opposite end before each
+      # stroke so time_based always runs the full open/close_duration.
+      # D1–D3: 15.9 s per stroke; D4 (0–10V): 90 s per stroke → 92 s waits.
+      # update_f2_coordinator does nothing while dampers_homing is true.
+      - id: damper_homing
+        mode: single
+        then:
+          - lambda: |-
+              id(dampers_homing) = true;
+              ESP_LOGI("homing", "Damper homing: full OPEN stroke");
+              id(HVAC_DAMPER_1).position = cover::COVER_CLOSED;
+              id(HVAC_DAMPER_2).position = cover::COVER_CLOSED;
+              id(HVAC_DAMPER_3).position = cover::COVER_CLOSED;
+              id(HVAC_DAMPER_4).position = cover::COVER_CLOSED;
+              id(HVAC_DAMPER_1).make_call().set_command_open().perform();
+              id(HVAC_DAMPER_2).make_call().set_command_open().perform();
+              id(HVAC_DAMPER_3).make_call().set_command_open().perform();
+              id(HVAC_DAMPER_4).make_call().set_command_open().perform();
+          - delay: 92s
+          - lambda: |-
+              ESP_LOGI("homing", "Damper homing: full CLOSE stroke");
+              id(HVAC_DAMPER_1).position = cover::COVER_OPEN;
+              id(HVAC_DAMPER_2).position = cover::COVER_OPEN;
+              id(HVAC_DAMPER_3).position = cover::COVER_OPEN;
+              id(HVAC_DAMPER_4).position = cover::COVER_OPEN;
+              id(HVAC_DAMPER_1).make_call().set_command_close().perform();
+              id(HVAC_DAMPER_2).make_call().set_command_close().perform();
+              id(HVAC_DAMPER_3).make_call().set_command_close().perform();
+              id(HVAC_DAMPER_4).make_call().set_command_close().perform();
+          - delay: 92s
+          - lambda: |-
+              id(dampers_homing) = false;
+              ESP_LOGI("homing", "Damper homing complete — all dampers closed");
+          - script.execute: update_f2_coordinator
+
+      # ── Postflow: after leaving heat/cool, keep the last-open dampers open and
+      # their fans running for 80 s to purge residual heat/cool off the coil.
+      # The coordinator holds the dampers/fans from f2_postflow_mask; this timer
+      # just ends the postflow and lets the coordinator close everything.
+      - id: f2_postflow_timer
+        mode: restart
+        then:
+          - delay: 80 s
+          - lambda: |-
+              id(f2_postflow_mask) = 0;
+              ESP_LOGD("f2_coordinator", "postflow finished");
+          - script.execute: update_f2_coordinator
+
+      # ── Floor 1 coordinator ──────────────────────────────────────────────
+      # Single source of truth for Floor 1 heat/cool. Called by Zone 0 Y1/W inputs,
+      # window sensor changes, heat-mode select, the 30s interval and the AC1 fault check.
+      # Every output is set explicitly each run so no branch can undo another's work.
+      # Fan-only (G) is still handled directly by T0_G_INPUT.
+      - id: update_f1_coordinator
+        mode: queued
+        max_runs: 1
+        then:
+          - lambda: |-
+              bool win_ok = !id(z0_win_open) || !id(win_sensors_enabled);
+              bool cool = win_ok && id(T0_Y1_INPUT).state && !id(T0_W_INPUT).state;
+              bool heat = win_ok && id(T0_W_INPUT).state && !id(T0_Y1_INPUT).state;
+              bool hp_mode  = id(sel_f1_heat_mode).current_option() == "heat_pump";
+              bool cmb_mode = id(sel_f1_heat_mode).current_option() == "combined";
+              bool hp  = heat && (hp_mode || cmb_mode);   // heat pump runs
+              bool gas = heat && !hp_mode;                 // furnace W runs (gas or combined)
+
+              if (cool || (heat && hp_mode)) id(furnace_Y_BLOWER).turn_on();
+              else                           id(furnace_Y_BLOWER).turn_off();
+              if (gas) id(furnace_W).turn_on();
+              else     id(furnace_W).turn_off();
+
+              // 0=idle 1=heat 2=cool — only publish / touch the LED when it changes
+              static int last_state = -1;
+              static int last_ac = -1;
+              int state = cool ? 2 : heat ? 1 : 0;
+              int ac    = cool ? 2 : hp ? 1 : 0;
+
+              if (ac != last_ac) {
+                const char* cmds[] = {
+                    "{\"power\":false}",
+                    "{\"power\":true,\"mode\":\"H\",\"temp\":27}",
+                    "{\"power\":true,\"mode\":\"C\",\"temp\":18}"
+                };
+                mqtt::global_mqtt_client->publish("${faikin_ac1}/command", cmds[ac]);
+                last_ac = ac;
+              }
+
+              if (state != last_state) {
+                const char* ms[] = {"idle", "heat", "cool"};
+                mqtt::global_mqtt_client->publish("${mqtt_prefix}/floor1/zone0/mode", ms[state]);
+                // Leave the LED alone while the window inhibit (red pulse) is showing
+                if (win_ok) {
+                  if (state == 0) {
+                    id(RGB_LED).make_call().set_state(false).perform();
+                  } else {
+                    auto c = id(RGB_LED).make_call();
+                    c.set_state(true);
+                    c.set_brightness(0.6f);
+                    if (state == 1) c.set_rgb(0.8f, 0.1f, 0.0f);
+                    else            c.set_rgb(0.0f, 0.1f, 0.8f);
+                    c.set_effect("pulse");
+                    c.perform();
+                  }
+                }
+                ESP_LOGD("f1_coordinator", "state %d -> %d (ac=%d gas=%d win_ok=%d)",
+                         last_state, state, ac, gas, win_ok);
+                last_state = state;
+              }
+
+      # ── Floor 2 coordinator ──────────────────────────────────────────────
+      # Called by any zone state change, window sensor change, IAQ update, or MQTT demand.
+      # Handles: weighted voting, compressor mode, dampers, fans, zone LEDs, MQTT publish.
+      - id: update_f2_coordinator
+        mode: queued
+        max_runs: 1
+        then:
+          - lambda: |-
+              //if (floor_2_manual_enabled) return;
+
+              // ── Zone input state ──────────────────────────────────────────────
+              // Indices: 0=Z1(w=1), 1=Z2 bathroom(w=1), 2=Z3(w=1), 3=Z4 masterbed
+              ESP_LOGD("f2_coordinator", "update_f2_coordinator: entry");
+              if (id(dampers_homing)) {
+                  ESP_LOGD("f2_coordinator", "skipped: damper homing in progress");
+                  return;
+              }
+
+              bool req_heat[4] = {
+
+                  id(T2_W_INPUT).state,
+                  id(z2_req_heat) && id(z2_heat_enabled).state,
+                  id(T3_W_INPUT).state,
+                  id(T1_W_INPUT).state
+              };
+
+              bool req_cool[4] = {
+                  id(T2_Y1_INPUT).state,
+                  id(z2_req_cool) && id(z2_cool_enabled).state,
+                  id(T3_Y1_INPUT).state,
+                  id(T1_Y1_INPUT).state
+              };
+
+              bool req_fan[4] = {
+
+                  id(T2_G_INPUT).state && !req_heat[0] && !req_cool[0],
+                  false,  // Zone 2 has no fan-only request
+                  id(T3_G_INPUT).state && !req_heat[2] && !req_cool[2],
+                  id(T1_G_INPUT).state && !req_heat[3] && !req_cool[3],
+              };
+
+              int weight[4] = {
+                  (int)id(z1_weight).state,
+                  (int)id(z2_weight).state,
+                  (int)id(z3_weight).state,
+                  (int)id(z4_weight).state
+              };
+
+              ESP_LOGD("f2_coordinator", "inputs: heat[%d,%d,%d,%d] cool[%d,%d,%d,%d] fan[%d,%d,%d,%d] weight[%d,%d,%d,%d]",
+                      req_heat[0], req_heat[1], req_heat[2], req_heat[3],
+                      req_cool[0], req_cool[1], req_cool[2], req_cool[3],
+                      req_fan[0], req_fan[1], req_fan[2], req_fan[3],
+                      weight[0], weight[1], weight[2], weight[3]);
+
+              // ── Duct satisfaction (within 0.5°C of setpoint while active) ────
+              bool duct_ok[4] = {
+                      true,  // no duct sensor for zone 1
+                      true,
+                      true,
+                      true  // no duct sensor for bathroom
+              };
+
+              // ── Weighted majority vote ─────────────────────────────────────────
+              int heat_score = 0, cool_score = 0, fan_score = 0;
+              for (int i = 0; i < 4; i++) {
+                  if (req_heat[i]) heat_score += weight[i];
+                  if (req_cool[i]) cool_score += weight[i];
+                  if (req_fan[i])  fan_score  += weight[i];
+              };
+
+              int nm = 0;
+              if      (heat_score > 0 && heat_score >= cool_score) nm = 1;
+              else if (cool_score > heat_score && cool_score > 0)  nm = 2;
+              else if (fan_score > 0)                              nm = 3;
+
+              ESP_LOGD("f2_coordinator", "vote: heat_score=%d cool_score=%d fan_score=%d -> nm=%d (cm=%d locked=%d)",
+                      heat_score, cool_score, fan_score, nm, id(floor2_mode), id(floor2_locked));
+
+              // ── Mode change with 4-min compressor lockout ─────────────────────
+              int cm = id(floor2_mode);
+              bool leaving_heat_cool = (cm == 1 || cm == 2) && nm == 0;
+              if (nm != cm)
+              {
+                  bool can_switch = !id(floor2_locked) || nm == 0;
+                  if (can_switch)
+                  {
+                      id(floor2_mode) = nm;
+                      if (nm != 0 && cm != nm) {
+                          id(floor2_locked) = true;
+                          id(mode_unlock_timer).execute();
+                      }
+                      const char* cmds[] = {
+                          "{\"power\":false}",
+                          "{\"power\":true,\"mode\":\"H\",\"temp\":27}",
+                          "{\"power\":true,\"mode\":\"C\",\"temp\":18}",
+                          "{\"power\":false}" //mot needed for Fan
+                      };
+
+                      ESP_LOGD("f2_coordinator", "mode change: cm=%d -> nm=%d, publishing %s to AC2", cm, nm, cmds[nm]);
+                      mqtt::global_mqtt_client->publish("${faikin_ac2}/command", cmds[nm]);
+                      cm = nm;
+                  } else {
+                      ESP_LOGD("f2_coordinator", "mode change blocked by lockout: cm=%d nm=%d", cm, nm);
+                  }
+              };
+
+              // ── Dampers: open if request matches active mode ──────────────────
+              // Array index: 0=Z1, 1=Z2/BATH, 2=Z4
+              // Damper entities: HVAC_DAMPER_1=Z1 HVAC_DAMPER_2=Z2, HVAC_DAMPER_3=Z3, HVAC_DAMPER_4/MASTER
+              bool open_d[4];
+              int open_mask = 0;
+              for (int i = 0; i < 4; i++) {
+                  open_d[i] = (cm==1 && req_heat[i]) ||
+                              (cm==2 && req_cool[i]) ||
+                              (cm==3 && req_fan[i]);
+                  if (open_d[i]) open_mask |= (1 << i);
+              };
+
+              // ── Postflow: hold the last heat/cool dampers open + fans on ──────
+              // State lives in f2_postflow_mask so it survives the frequent
+              // re-runs (DS18B20 every 20s, IAQ every 60s, input releases).
+              if (leaving_heat_cool) {
+                  id(f2_postflow_mask) = id(f2_last_open_mask);
+                  if (id(f2_postflow_mask) != 0) {
+                      ESP_LOGD("f2_coordinator", "postflow start: mask=0x%X for 80s", id(f2_postflow_mask));
+                      id(f2_postflow_timer).execute();
+                  }
+              } else if (cm == 1 || cm == 2) {
+                  // New heat/cool call — cancel any postflow in progress
+                  if (id(f2_postflow_mask) != 0) {
+                      ESP_LOGD("f2_coordinator", "postflow cancelled by new call");
+                      id(f2_postflow_mask) = 0;
+                      id(f2_postflow_timer).stop();
+                  }
+              }
+              if (cm == 1 || cm == 2) id(f2_last_open_mask) = open_mask;
+              else                    id(f2_last_open_mask) = 0;
+              for (int i = 0; i < 4; i++) {
+                  if (id(f2_postflow_mask) & (1 << i)) open_d[i] = true;
+              }
+
+              ESP_LOGD("f2_coordinator", "dampers: open_d[%d,%d,%d,%d] postflow=0x%X",
+                      open_d[0], open_d[1], open_d[2], open_d[3], id(f2_postflow_mask));
+              if (open_d[0]) id(HVAC_DAMPER_1).make_call().set_position(0.86f).perform();
+              else           id(HVAC_DAMPER_1).make_call().set_position(0.0f).perform();
+              if (open_d[1]) id(HVAC_DAMPER_2).make_call().set_position(0.6f).perform();
+              else           id(HVAC_DAMPER_2).make_call().set_position(0.0f).perform();
+              if (open_d[2]) id(HVAC_DAMPER_3).make_call().set_position(0.62).perform();
+              else           id(HVAC_DAMPER_3).make_call().set_position(0.0f).perform();
+              if (open_d[3]) id(HVAC_DAMPER_4).make_call().set_position(1.0f).perform();
+              else           id(HVAC_DAMPER_4).make_call().set_position(0.0f).perform();
+
+
+              // ── Fan speeds: fan0 serves Z1+Z2+Z3, fan1 serves Z4 ─────────────
+              // open_d already includes postflow dampers, so the fans keep running
+              // at the matching speed for as long as postflow holds them open.
+              int f0_cnt = (int)open_d[0] + (int)open_d[1] + (int)open_d[2];
+              int f1_cnt = (int)open_d[3];
+              if (f0_cnt == 0) {
+                id(fan0).make_call().set_state(false).perform();
+              } else {
+                switch (f0_cnt) {
+                  case 1: id(fan0).make_call().set_state(true).set_speed(18).perform(); break;
+                  case 2: id(fan0).make_call().set_state(true).set_speed(22).perform(); break;
+                  case 3: id(fan0).make_call().set_state(true).set_speed(24).perform(); break;
+                }
+              }
+
+              if (f1_cnt == 0) {
+                id(fan1).make_call().set_state(false).perform();
+              } else {
+                id(fan1).make_call().set_state(true).set_speed(54).perform();
+              }
+
+              ESP_LOGD("f2_coordinator", "fans: f0_cnt=%d f1_cnt=%d", f0_cnt, f1_cnt);
+
+              //--- fan_power_120 turn on heat/cool/fan/off
+
+              // ── MQTT floor2 mode publish ──────────────────────────────────────
+              const char* ms[] = {"off", "heat", "cool", "fan"};
+              ESP_LOGD("f2_coordinator", "exit: publishing mode=%s", ms[cm]);
+              mqtt::global_mqtt_client->publish(
+                  "${mqtt_prefix}/floor2/mode/state", ms[cm], 0, true);
+
+    # ─── SENSORS ─────────────────────────────────────────────────────────────────
+    sensor:
+      - platform: template
+        id: AC1_fanfreq
+        name: "AC1 Fan RPM"
+        unit_of_measurement: "rpm"
+        accuracy_decimals: 0
+        state_class: measurement
+
+      - platform: template
+        id: AC2_fanfreq
+        name: "AC2 Fan RPM"
+        unit_of_measurement: "rpm"
+        accuracy_decimals: 0
+        state_class: measurement
+
+      - platform: wifi_signal
+        name: "WiFi Signal"
+        update_interval: 60s
+        entity_category: diagnostic
+
+      - platform: uptime
+        name: "Uptime"
+        update_interval: 60s
+        entity_category: diagnostic
+
+      # ── DS18B20 zone temperatures ─────────────────────────────────────────────
+      - platform: dallas_temp
+        address: 0x6100000075e91f28
+        name: "AC1 SUCTION LINE Temperature"
+        id: ac1_suction_temp
+        resolution: 12
+        update_interval: 20s
+        on_value:
+          - mqtt.publish:
+              topic: ${mqtt_prefix}/floor2/zone1/temperature
+              payload: !lambda "return to_string(x);"
+          - script.execute: update_f2_coordinator  # re-evaluate duct satisfaction
+
+      - platform: dallas_temp
+        address: 0x4900000687ce0328
+        name: "AC 2 suctIOn line temp"
+        id: ac2_suction_temp
+        resolution: 12
+        update_interval: 20s
+        on_value:
+          - mqtt.publish:
+              topic: ${mqtt_prefix}/floor2/zone2/temperature
+              payload: !lambda "return to_string(x);"
+          - script.execute: update_f2_coordinator
+
+      - platform: dallas_temp
+        address: 0x38012033488ac928
+        name: "sparre  temp"
+        id: ac_suction_temp
+        resolution: 12
+        update_interval: 20s
+        on_value:
+          - mqtt.publish:
+              topic: ${mqtt_prefix}/floor2/zone2/temperature
+              payload: !lambda "return to_string(x);"
+          - script.execute: update_f2_coordinator
+
+      # ── BME680 AQI ──────────────────────────────────────────────────────────────
+      - platform: bme680
+        i2c_id: bus_a
+        address: 0x77
+        update_interval: 30s
+        temperature:
+          name: "AQI Sensor Temperature"
+          id: bme680_temp
+          accuracy_decimals: 1
+        humidity:
+          name: "AQI Sensor Humidity"
+          id: bme680_humidity
+          accuracy_decimals: 1
+        pressure:
+          name: "AQI Sensor Pressure"
+          accuracy_decimals: 1
+        gas_resistance:
+          name: "Gas Resistance"
+          id: bme680_gas
+          accuracy_decimals: 0
+          unit_of_measurement: "Ω"
+          icon: "mdi:chemical-weapon"
+
+      # ── Calculated IAQ ────────────────────────────────────────────────────────
+      - platform: template
+        name: "IAQ Index"
+        id: iaq_index
+        icon: "mdi:air-filter"
+        accuracy_decimals: 0
+        unit_of_measurement: "IAQ"
+        update_interval: 60s
+        lambda: |-
+          if (!id(bme680_gas).has_state() || !id(bme680_humidity).has_state())
+            return NAN;
+          float gas  = id(bme680_gas).state;
+          float hum  = id(bme680_humidity).state;
+          const float gas_ref = 250000.0f;
+          float gas_score = gas / (gas + gas_ref) * 2.0f;
+          if (gas_score > 1.0f) gas_score = 1.0f;
+          float hum_score = (hum < 40.0f) ? (hum / 40.0f) : (1.0f - ((hum - 40.0f) / 60.0f));
+          hum_score = std::max(0.0f, std::min(1.0f, hum_score));
+          float combined = (gas_score * 0.75f) + (hum_score * 0.25f);
+          float iaq = std::max(0.0f, std::min(500.0f, (1.0f - combined) * 500.0f));
+          std::string cat;
+          if      (iaq <= 50)  cat = "Excellent";
+          else if (iaq <= 100) cat = "Good";
+          else if (iaq <= 150) cat = "Lightly Polluted";
+          else if (iaq <= 200) cat = "Moderately Polluted";
+          else if (iaq <= 250) cat = "Heavily Polluted";
+          else if (iaq <= 350) cat = "Severely Polluted";
+          else                 cat = "Extremely Polluted";
+          id(iaq_category).publish_state(cat);
+          mqtt::global_mqtt_client->publish("${mqtt_prefix}/aqi/state", to_string((int)iaq));
+          if (iaq > 250) {
+            id(fan0).make_call().set_state(true).set_speed(40).perform();
+            id(fan1).make_call().set_state(true).set_speed(70).perform();
+            // +++ damper override for IAQ
+          }
+          // Update zone LED AQI colours on idle zones
+          id(update_f2_coordinator).execute();
+          return iaq;
+
+      # ── Diagnostics ──────────────────────────────────────────────────────────
+      - platform: wifi_signal
+        name: "HVAC Controller WiFi Signal"
+        update_interval: 60s
+
+    # ─── BINARY SENSORS ──────────────────────────────────────────────────────────
+    binary_sensor:
+      # Holds the latest values decoded from the AC's state JSON
+
+      - platform: template
+        id: AC1_power
+        name: "AC1 Power State"
+        device_class: power
+
+      - platform: template
+        id: AC1_FAN_rpm_fault
+        name: "AC1 Fan RPM Fault"
+        device_class: problem
+
+      - platform: template
+        id: AC2_power
+        name: "AC2_Power State"
+        device_class: power
+
+      - platform: template
+        id: AC2_FAN_rpm_fault
+        name: "AC2 Fan RPM Fault"
+        device_class: problem
+
+      # ── Zone window sensors — all Zigbee via Zigbee2MQTT ─────────────────────
+      - platform: template
+        name: "Zone 0 Windows"
+        id: WIN_Z0
+        device_class: window
+        lambda: "return id(z0_win_open);"
+
+
+      ######## zone 0 cool call  l####
+      - platform: gpio
+        name: "Z 0 COOL CALL"
+        id: T0_Y1_INPUT
+        trigger_on_initial_state: true
+        pin:
+          {
+            pcf8574: pcf8575_hub,
+            number: 0,
+            mode: { input: true },
+            inverted: false,
+          }
+        filters: [delayed_on: 2ms, delayed_off: 2800ms]
+        on_state:
+          then:
+          - script.execute: update_f1_coordinator
+
+
+
+      - platform: gpio
+        name:  "Z 0 HEAT CALL"
+        id: T0_W_INPUT
+        trigger_on_initial_state: true
+        pin:
+          {
+
+            pcf8574: pcf8575_hub,
+            number: 1,
+            mode: { input: true },
+            inverted: false,
+          }
+        filters: [delayed_on: 2ms, delayed_off: 2800ms]
+        on_state:
+          then:
+          - script.execute: update_f1_coordinator
+
+      # ── ZONE 0 THRM0 thermostat inputs (Floor 1) — PCF8575 pins 0–3 ───────────────
+      - platform: gpio
+        name: "Z 0 FAN CALL"
+        id: T0_G_INPUT
+        trigger_on_initial_state: true
+        pin:
+          {
+            pcf8574: pcf8575_hub,
+            number: 2,
+            mode: { input: true },
+            inverted: false,
+          }
+        filters: [delayed_on: 2ms, delayed_off: 2800ms]
+        on_press:
+          then:
+            - if:
+                condition:
+                  lambda: "return !id(z0_win_open) || !id(win_sensors_enabled);"
+                then:
+                  - switch.turn_on: furnace_G
+                  - mqtt.publish:
+                      { topic: "${mqtt_prefix}/floor1/zone0/mode", payload: "fan" }
+                # - light.turn_on: { id: RGB_LED, brightness: 60%, red: 0%, green: 80%, blue: 0%, effect: pulse }
+        on_release:
+          then:
+            - switch.turn_off: furnace_G
+            - light.turn_off: { id: RGB_LED }
+            - mqtt.publish:
+                { topic: "${mqtt_prefix}/floor1/zone0/mode", payload: "idle" }
+
+
+
+      - platform: gpio
+        name: "Z 0 OPT CALL"
+        id: T0_O_INPUT
+        trigger_on_initial_state: true
+        pin:
+          {
+            pcf8574: pcf8575_hub,
+            number: 3,
+            mode: { input: true },
+            inverted: false
+          }
+        filters: [delayed_on: 2ms, delayed_off: 2800ms]
+
+      # ── ZONE 1 thermostat inputs (Floor 2, THERM1... Master Bedroom) — PCF8575 pins 4–7 ─
+      - platform: gpio
+        name: "Z 4 Cool CALL"
+        id: T1_Y1_INPUT
+        trigger_on_initial_state: true
+        pin:
+          {
+            pcf8574: pcf8575_hub,
+            number: 4,
+            mode: { input: true },
+            inverted: false
+          }
+        filters: [delayed_on: 8ms, delayed_off: 2800ms]
+        on_press:
+          then:
+            - logger.log: "on_press event "
+            - script.execute: update_f2_coordinator
+        on_release:
+          then:
+            - script.execute: update_f2_coordinator
+
+      - platform: gpio
+        name: "Z 4 HEAT CALL"
+        id: T1_W_INPUT
+        trigger_on_initial_state: true
+        pin:
+          {
+            pcf8574: pcf8575_hub,
+            number: 5,
+            mode: { input: true },
+            inverted: false,
+          }
+        filters: [delayed_on: 8ms, delayed_off: 2800ms]
+        on_press:
+          then:
+            - script.execute: update_f2_coordinator
+        on_release:
+          then:
+            - script.execute: update_f2_coordinator
+
+      - platform: gpio
+        name: "Z 4 FAN CALL"
+        id: T1_G_INPUT
+        trigger_on_initial_state: true
+        pin:
+          {
+            pcf8574: pcf8575_hub,
+            number: 6,
+            mode: { input: true },
+            inverted: false,
+          }
+        filters: [delayed_on: 2ms, delayed_off: 2800ms]
+        on_press:
+          then:
+            - script.execute: update_f2_coordinator
+        on_release:
+          then:
+            - script.execute: update_f2_coordinator
+
+      # PCF8575 pin 7 — Zone 4 OPT (spare, unused — window sensor is Zigbee)
+      - platform: gpio
+        name: "Z 4 OPT CALL"
+        id: T1_O_INPUT
+        trigger_on_initial_state: true
+        pin:
+          {
+            pcf8574: pcf8575_hub,
+            number: 7,
+            mode: { input: true },
+            inverted: false,
+          }
+        filters: [delayed_on: 2ms, delayed_off: 2800ms]
+
+
+      # ── ZONE 1 THERM2 thermosta\t inputs (Floor 2) — PCF8575 pins 8–11 ──────────────
+      - platform: gpio
+        name: "Z 1 COOL CALL"
+        id: T2_Y1_INPUT
+        trigger_on_initial_state: true
+        pin:
+          {
+            pcf8574: pcf8575_hub,
+            number: 8,
+            mode: { input: true },
+            inverted: false,
+          }
+        filters: [delayed_on: 2ms, delayed_off: 2800ms]
+
+        on_press:
+          then:
+            - script.execute: update_f2_coordinator
+        on_release:
+          then:
+            - script.execute: update_f2_coordinator
+
+      - platform: gpio
+        name: "Z 1 HEAT CALL"
+        id: T2_W_INPUT
+        trigger_on_initial_state: true
+        pin:
+          {
+            pcf8574: pcf8575_hub,
+            number: 9,
+            mode: { input: true },
+            inverted: false,
+          }
+        filters: [delayed_on: 2ms, delayed_off: 2800ms]
+        on_press:
+          then:
+            - script.execute: update_f2_coordinator
+        on_release:
+          then:
+            - script.execute: update_f2_coordinator
+
+      - platform: gpio
+        name: "Z 1 FAN CALL"
+        id: T2_G_INPUT
+        trigger_on_initial_state: true
+        pin:
+          {
+            pcf8574: pcf8575_hub,
+            number: 10,
+            mode: { input: true },
+            inverted: false,
+          }
+        filters: [delayed_on: 2ms, delayed_off: 2800ms]
+        on_press:
+          then:
+            - script.execute: update_f2_coordinator
+        on_release:
+          then:
+            - script.execute: update_f2_coordinator
+
+      # PCF8575 pin 11 — Zone 2 OPT (spare, unused — window sensor is Zigbee)
+      - platform: gpio
+        name: "Z 1 OPT CALL"
+        id: T2_O_INPUT
+        trigger_on_initial_state: true
+        pin:
+          {
+            pcf8574: pcf8575_hub,
+            number: 11,
+            mode: { input: true },
+            inverted: false,
+          }
+        filters: [delayed_on: 2ms, delayed_off: 2800ms]
+
+      # ── ZONE 3 thermostat inputs (Floor 2) — PCF8575 pins 12–15 ─────────────
+      - platform: gpio
+        name: "Z 3 Cool Request"
+        id: T3_Y1_INPUT
+        trigger_on_initial_state: true
+        pin:
+          {
+            pcf8574: pcf8575_hub,
+            number: 12,
+            mode: { input: true },
+            inverted: false,
+          }
+        filters: [delayed_on: 2ms, delayed_off: 2800ms]
+        on_state:
+          then:
+            - script.execute: update_f2_coordinator
+
+      - platform: gpio
+        name: "Zone 3 Heat Request"
+        id: T3_W_INPUT
+        trigger_on_initial_state: true
+        pin:
+          {
+            pcf8574: pcf8575_hub,
+            number: 13,
+            mode: { input: true },
+            inverted: false,
+          }
+        filters: [delayed_on: 2ms, delayed_off: 2800ms]
+        on_press:
+          then:
+            - script.execute: update_f2_coordinator
+        on_release:
+          then:
+            - script.execute: update_f2_coordinator
+
+      - platform: gpio
+        name: "Zone 3 Fan Request"
+        id: T3_G_INPUT
+        trigger_on_initial_state: true
+        pin:
+          {
+            pcf8574: pcf8575_hub,
+            number: 14,
+            mode: { input: true },
+            inverted: false,
+          }
+        filters: [delayed_on: 2ms, delayed_off: 2800ms]
+        on_press:
+          then:
+            - script.execute: update_f2_coordinator
+        on_release:
+          then:
+            - script.execute: update_f2_coordinator
+
+      # PCF8575 pin 15 — Zone 3 OPT (spare, unused — window sensor is Zigbee)
+      - platform: gpio
+        name: "Z3 OPT CALL"
+        id: T3_OPT_INPUT
+        trigger_on_initial_state: true
+        pin:
+          {
+            pcf8574: pcf8575_hub,
+            number: 15,
+            mode: { input: true },
+            inverted: false,
+          }
+        filters: [delayed_on: 2ms, delayed_off: 2800ms]
+
+
+      # ── AQI alerts ──────────────────────────────────────────────────────────
+      - platform: template
+        name: "Air Quality Warning"
+        id: aqi_warning
+        device_class: problem
+        icon: "mdi:air-filter"
+        lambda: "return id(iaq_index).has_state() && id(iaq_index).state > 150;"
+
+      - platform: template
+        name: "Air Quality Alert"
+        id: aqi_alert
+        device_class: problem
+        icon: "mdi:smog"
+        lambda: "return id(iaq_index).has_state() && id(iaq_index).state > 200;"
+
+      - platform: template
+        name: "Air Quality Critical"
+        id: aqi_critical
+        device_class: problem
+        icon: "mdi:skull-crossbones"
+        lambda: "return id(iaq_index).has_state() && id(iaq_index).state > 300;"
+
+      # ─── TEXT SENSORS ─────────────────────────────────────────────────────────────
+    text_sensor:
+      - platform: wifi_info
+        ip_address:
+          name: "${friendly_name} IP Address"
+
+      - platform: template
+        name: "${friendly_name} Uptime"
+        id: uptime_human
+        icon: mdi:clock-start
+        update_interval: 60s
+        lambda: |-
+          uint32_t s = millis() / 1000;
+          uint32_t d = s / 86400; s %= 86400;
+          uint32_t h = s / 3600;  s %= 3600;
+          uint32_t m = s / 60;    s %= 60;
+          char buf[32];
+          snprintf(buf, sizeof(buf), "%ud %02uh %02um %02us", d, h, m, s);
+          return {buf};
+
+      - platform: template
+        name: "Air Quality Category"
+        id: iaq_category
+        icon: "mdi:leaf"
+        lambda: 'return {"Initializing..."};'
+
+    interval:
+      # Re-evaluate every 60 seconds even if the original state does not change
+      - interval: 30s
+        then:
+          - script.execute: update_f1_coordinator
+
+
+      - interval: 60 s
+        then:
+          - if:
+              condition:
+                binary_sensor.is_on: AC1_power
+              then:
+                - if:
+                    condition:
+                      lambda: "return id(AC1_fanfreq).state < 95;"
+                    then:
+                      - script.execute: update_f1_coordinator
+                      - binary_sensor.template.publish:
+                          id: AC1_FAN_rpm_fault
+                          state: ON
+                      - logger.log:
+                          format: "AC1 fan RPM too low: %.0f rpm (unit ON)"
+                          args: ["id(AC1_fanfreq).state"]
+                      - mqtt.publish:
+                          topic: HVAC_MULTI_Z/floor1/ac/alert
+                          payload: "FAN_AC1_LOW_RPM"
+                          qos: 1
+                      - delay: 5 s
+                      - mqtt.publish:
+                          topic: ${faikin_ac1}/command
+                          payload: "{\"power\":false}"
+                          qos: 1
+                          retain: false
+                      - delay: 5 s
+                      - mqtt.publish:
+                          topic: ${faikin_ac1}/command
+                          payload: "{\"power\":true}"
+                          qos: 1
+                          retain:  false
+
+                    else:
+                      - script.execute: update_f2_coordinator
+                      - binary_sensor.template.publish:
+                          id: AC1_FAN_rpm_fault
+                          state: OFF
+
+              else:
+                # unit is off — clear any fault, nothing to check
+
+                - binary_sensor.template.publish:
+                    id: AC1_FAN_rpm_fault
+                    state: OFF
+
+          - if:
+              condition:
+                binary_sensor.is_on: AC2_power
+              then:
+                - if:
+                    condition:
+                      lambda: "return id(AC2_fanfreq).state < 95;"
+                    then:
+                      - binary_sensor.template.publish:
+                          id: AC2_FAN_rpm_fault
+                          state: ON
+
+                      - logger.log:
+                          format: "AC 2 fan RPM too low: %.0f rpm (unit ON)"
+                          args: ["id(AC2_fanfreq).state"]
+                      - mqtt.publish:
+                          topic: HVAC_MULTI_Z/floor2/ac/alert
+                          payload: "AC2_FAN_LOW_RPM"
+                          qos: 1
+                      - delay: 5s
+                      - mqtt.publish:
+                          topic: ${faikin_ac2}/command
+                          payload: "{\"power\":false}"
+                          qos: 1
+                          retain: false
+
+                      - delay: 20s
+                      - mqtt.publish:
+                          topic: ${faikin_ac2}/command
+                          payload: "{\"power\":true}"
+                          qos: 1
+                          retain: false
+                    else:
+                      - binary_sensor.template.publish:
+                          id: AC2_FAN_rpm_fault
+                          state: OFF
+
+
+              else:
+                # unit is off — clear any fault, nothing to check
+                - binary_sensor.template.publish:
+                    id: AC2_FAN_rpm_fault
+                    state: OFF
+
+    # ─── TIME ─────────────────────────────────────────────────────────────────────
+    time:
+      - platform: sntp
+        id: current_time
+
+    # ─── LIGHTS ───────────────────────────────────────────────────────────────────
+    light:
+      - platform: esp32_rmt_led_strip
+        rgb_order: GRB
+        pin: GPIO48
+        num_leds: 1
+        chipset: ws2812
+        id: RGB_LED
+        name: "RGB_LED"
+        effects:
+          - pulse:
+
+      - platform: monochromatic
+        output: led_status_rgb
+        name: "led_status_rgb"
+        effects:
+          - pulse:
+              name: "Fast Pulse"
+              transition_length: 0.5s
+              update_interval: 0.5s
+
+              min_brightness: 0%
+              max_brightness: 100%
+          - pulse:
+              name: "Slow Pulse"
+              transition_length: 2s
+              update_interval: 2s
+              min_brightness: 10%
+              max_brightness: 100%
+          - pulse:
+              name: "Asymmetrical Pulsef"
+              transition_length:
+                on_length: 1s
+                off_length: 500ms
+              update_interval: 1.5s
+              min_brightness: 0%
+              max_brightness: 100%
